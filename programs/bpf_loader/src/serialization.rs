@@ -1,22 +1,19 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    byteorder::{ByteOrder, LittleEndian},
+    solana_instruction::error::InstructionError,
+    solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_program_runtime::invoke_context::SerializedAccountMetadata,
-    solana_rbpf::{
+    solana_pubkey::Pubkey,
+    solana_sbpf::{
         aligned_memory::{AlignedMemory, Pod},
         ebpf::{HOST_ALIGN, MM_INPUT_START},
         memory_region::{MemoryRegion, MemoryState},
     },
-    solana_sdk::{
-        bpf_loader_deprecated,
-        entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
-        instruction::InstructionError,
-        pubkey::Pubkey,
-        system_instruction::MAX_PERMITTED_DATA_LENGTH,
-        transaction_context::{
-            BorrowedAccount, IndexOfAccount, InstructionContext, TransactionContext,
-        },
+    solana_sdk_ids::bpf_loader_deprecated,
+    solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
+    solana_transaction_context::{
+        BorrowedAccount, IndexOfAccount, InstructionContext, TransactionContext,
     },
     std::mem::{self, size_of},
 };
@@ -32,7 +29,7 @@ enum SerializeAccount<'a> {
 }
 
 struct Serializer {
-    pub buffer: AlignedMemory<HOST_ALIGN>,
+    buffer: AlignedMemory<HOST_ALIGN>,
     regions: Vec<MemoryRegion>,
     vaddr: u64,
     region_start: usize,
@@ -56,7 +53,7 @@ impl Serializer {
         self.buffer.fill_write(num, value)
     }
 
-    pub fn write<T: Pod>(&mut self, value: T) -> u64 {
+    fn write<T: Pod>(&mut self, value: T) -> u64 {
         self.debug_assert_alignment::<T>();
         let vaddr = self
             .vaddr
@@ -192,6 +189,7 @@ pub fn serialize_parameters(
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     copy_account_data: bool,
+    mask_out_rent_epoch_in_vm_serialization: bool,
 ) -> Result<
     (
         AlignedMemory<HOST_ALIGN>,
@@ -240,6 +238,7 @@ pub fn serialize_parameters(
             instruction_context.get_instruction_data(),
             &program_id,
             copy_account_data,
+            mask_out_rent_epoch_in_vm_serialization,
         )
     } else {
         serialize_parameters_aligned(
@@ -247,11 +246,12 @@ pub fn serialize_parameters(
             instruction_context.get_instruction_data(),
             &program_id,
             copy_account_data,
+            mask_out_rent_epoch_in_vm_serialization,
         )
     }
 }
 
-pub fn deserialize_parameters(
+pub(crate) fn deserialize_parameters(
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     copy_account_data: bool,
@@ -287,6 +287,7 @@ fn serialize_parameters_unaligned(
     instruction_data: &[u8],
     program_id: &Pubkey,
     copy_account_data: bool,
+    mask_out_rent_epoch_in_vm_serialization: bool,
 ) -> Result<
     (
         AlignedMemory<HOST_ALIGN>,
@@ -341,7 +342,12 @@ fn serialize_parameters_unaligned(
                 let vm_owner_addr = s.write_all(account.get_owner().as_ref());
                 #[allow(deprecated)]
                 s.write::<u8>(account.is_executable() as u8);
-                s.write::<u64>((account.get_rent_epoch()).to_le());
+                let rent_epoch = if mask_out_rent_epoch_in_vm_serialization {
+                    u64::MAX
+                } else {
+                    account.get_rent_epoch()
+                };
+                s.write::<u64>(rent_epoch.to_le());
                 accounts_metadata.push(SerializedAccountMetadata {
                     original_data_len: account.get_data().len(),
                     vm_key_addr,
@@ -360,7 +366,7 @@ fn serialize_parameters_unaligned(
     Ok((mem, regions, accounts_metadata))
 }
 
-pub fn deserialize_parameters_unaligned<I: IntoIterator<Item = usize>>(
+fn deserialize_parameters_unaligned<I: IntoIterator<Item = usize>>(
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     copy_account_data: bool,
@@ -381,11 +387,12 @@ pub fn deserialize_parameters_unaligned<I: IntoIterator<Item = usize>>(
             start += size_of::<u8>(); // is_signer
             start += size_of::<u8>(); // is_writable
             start += size_of::<Pubkey>(); // key
-            let lamports = LittleEndian::read_u64(
-                buffer
-                    .get(start..)
-                    .ok_or(InstructionError::InvalidArgument)?,
-            );
+            let lamports = buffer
+                .get(start..start.saturating_add(8))
+                .map(<[u8; 8]>::try_from)
+                .and_then(Result::ok)
+                .map(u64::from_le_bytes)
+                .ok_or(InstructionError::InvalidArgument)?;
             if borrowed_account.get_lamports() != lamports {
                 borrowed_account.set_lamports(lamports)?;
             }
@@ -419,6 +426,7 @@ fn serialize_parameters_aligned(
     instruction_data: &[u8],
     program_id: &Pubkey,
     copy_account_data: bool,
+    mask_out_rent_epoch_in_vm_serialization: bool,
 ) -> Result<
     (
         AlignedMemory<HOST_ALIGN>,
@@ -476,7 +484,12 @@ fn serialize_parameters_aligned(
                 let vm_lamports_addr = s.write::<u64>(borrowed_account.get_lamports().to_le());
                 s.write::<u64>((borrowed_account.get_data().len() as u64).to_le());
                 let vm_data_addr = s.write_account(&mut borrowed_account)?;
-                s.write::<u64>((borrowed_account.get_rent_epoch()).to_le());
+                let rent_epoch = if mask_out_rent_epoch_in_vm_serialization {
+                    u64::MAX
+                } else {
+                    borrowed_account.get_rent_epoch()
+                };
+                s.write::<u64>(rent_epoch.to_le());
                 accounts_metadata.push(SerializedAccountMetadata {
                     original_data_len: borrowed_account.get_data().len(),
                     vm_key_addr,
@@ -500,7 +513,7 @@ fn serialize_parameters_aligned(
     Ok((mem, regions, accounts_metadata))
 }
 
-pub fn deserialize_parameters_aligned<I: IntoIterator<Item = usize>>(
+fn deserialize_parameters_aligned<I: IntoIterator<Item = usize>>(
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     copy_account_data: bool,
@@ -529,20 +542,22 @@ pub fn deserialize_parameters_aligned<I: IntoIterator<Item = usize>>(
                 .get(start..start + size_of::<Pubkey>())
                 .ok_or(InstructionError::InvalidArgument)?;
             start += size_of::<Pubkey>(); // owner
-            let lamports = LittleEndian::read_u64(
-                buffer
-                    .get(start..)
-                    .ok_or(InstructionError::InvalidArgument)?,
-            );
+            let lamports = buffer
+                .get(start..start.saturating_add(8))
+                .map(<[u8; 8]>::try_from)
+                .and_then(Result::ok)
+                .map(u64::from_le_bytes)
+                .ok_or(InstructionError::InvalidArgument)?;
             if borrowed_account.get_lamports() != lamports {
                 borrowed_account.set_lamports(lamports)?;
             }
             start += size_of::<u64>(); // lamports
-            let post_len = LittleEndian::read_u64(
-                buffer
-                    .get(start..)
-                    .ok_or(InstructionError::InvalidArgument)?,
-            ) as usize;
+            let post_len = buffer
+                .get(start..start.saturating_add(8))
+                .map(<[u8; 8]>::try_from)
+                .and_then(Result::ok)
+                .map(u64::from_le_bytes)
+                .ok_or(InstructionError::InvalidArgument)? as usize;
             start += size_of::<u64>(); // data length
             if post_len.saturating_sub(pre_len) > MAX_PERMITTED_DATA_INCREASE
                 || post_len > MAX_PERMITTED_DATA_LENGTH as usize
@@ -622,14 +637,12 @@ pub(crate) fn account_data_region_memory_state(account: &BorrowedAccount<'_>) ->
 mod tests {
     use {
         super::*,
+        solana_account::{Account, AccountSharedData, WritableAccount},
+        solana_account_info::AccountInfo,
+        solana_program_entrypoint::deserialize,
         solana_program_runtime::with_mock_invoke_context,
-        solana_sdk::{
-            account::{Account, AccountSharedData, WritableAccount},
-            account_info::AccountInfo,
-            bpf_loader,
-            entrypoint::deserialize,
-            transaction_context::InstructionAccount,
-        },
+        solana_sdk_ids::bpf_loader,
+        solana_transaction_context::InstructionAccount,
         std::{
             cell::RefCell,
             mem::transmute,
@@ -637,6 +650,31 @@ mod tests {
             slice::{self, from_raw_parts, from_raw_parts_mut},
         },
     };
+
+    fn deduplicated_instruction_accounts(
+        transaction_indexes: &[IndexOfAccount],
+        is_writable: fn(usize) -> bool,
+    ) -> Vec<InstructionAccount> {
+        transaction_indexes
+            .iter()
+            .enumerate()
+            .map(|(index_in_instruction, index_in_transaction)| {
+                let index_in_callee = transaction_indexes
+                    .get(0..index_in_instruction)
+                    .unwrap()
+                    .iter()
+                    .position(|account_index| account_index == index_in_transaction)
+                    .unwrap_or(index_in_instruction);
+                InstructionAccount {
+                    index_in_transaction: *index_in_transaction,
+                    index_in_caller: *index_in_transaction,
+                    index_in_callee: index_in_callee as IndexOfAccount,
+                    is_signer: false,
+                    is_writable: is_writable(index_in_instruction),
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn test_serialize_parameters_with_many_accounts() {
@@ -673,7 +711,7 @@ mod tests {
                     expected_err: Some(InstructionError::MaxAccountsExceeded),
                 },
             ] {
-                let program_id = solana_sdk::pubkey::new_rand();
+                let program_id = solana_pubkey::new_rand();
                 let mut transaction_accounts = vec![(
                     program_id,
                     AccountSharedData::from(Account {
@@ -696,15 +734,11 @@ mod tests {
                         }),
                     ));
                 }
-                let mut instruction_accounts: Vec<_> = (0..num_ix_accounts as IndexOfAccount)
-                    .map(|index_in_callee| InstructionAccount {
-                        index_in_transaction: index_in_callee + 1,
-                        index_in_caller: index_in_callee + 1,
-                        index_in_callee,
-                        is_signer: false,
-                        is_writable: false,
-                    })
-                    .collect();
+
+                let transaction_accounts_indexes: Vec<IndexOfAccount> =
+                    (1..(num_ix_accounts + 1) as u16).collect();
+                let mut instruction_accounts =
+                    deduplicated_instruction_accounts(&transaction_accounts_indexes, |_| false);
                 if append_dup_account {
                     instruction_accounts.push(instruction_accounts.last().cloned().unwrap());
                 }
@@ -731,6 +765,7 @@ mod tests {
                     invoke_context.transaction_context,
                     instruction_context,
                     copy_account_data,
+                    true, // mask_out_rent_epoch_in_vm_serialization
                 );
                 assert_eq!(
                     serialization_result.as_ref().err(),
@@ -763,14 +798,14 @@ mod tests {
                         .unwrap();
                     let account = invoke_context
                         .transaction_context
-                        .get_account_at_index(index_in_transaction)
-                        .unwrap()
-                        .borrow();
+                        .accounts()
+                        .try_borrow(index_in_transaction)
+                        .unwrap();
                     assert_eq!(account.lamports(), account_info.lamports());
                     assert_eq!(account.data(), &account_info.data.borrow()[..]);
                     assert_eq!(account.owner(), account_info.owner);
                     assert_eq!(account.executable(), account_info.executable);
-                    assert_eq!(account.rent_epoch(), account_info.rent_epoch);
+                    assert_eq!(u64::MAX, account_info.rent_epoch);
                 }
             }
         }
@@ -779,7 +814,7 @@ mod tests {
     #[test]
     fn test_serialize_parameters() {
         for copy_account_data in [false, true] {
-            let program_id = solana_sdk::pubkey::new_rand();
+            let program_id = solana_pubkey::new_rand();
             let transaction_accounts = vec![
                 (
                     program_id,
@@ -792,7 +827,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 1,
                         data: vec![1u8, 2, 3, 4, 5],
@@ -802,7 +837,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 2,
                         data: vec![11u8, 12, 13, 14, 15, 16, 17, 18, 19],
@@ -812,7 +847,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 3,
                         data: vec![],
@@ -822,7 +857,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 4,
                         data: vec![1u8, 2, 3, 4, 5],
@@ -832,7 +867,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 5,
                         data: vec![11u8, 12, 13, 14, 15, 16, 17, 18, 19],
@@ -842,7 +877,7 @@ mod tests {
                     }),
                 ),
                 (
-                    solana_sdk::pubkey::new_rand(),
+                    solana_pubkey::new_rand(),
                     AccountSharedData::from(Account {
                         lamports: 6,
                         data: vec![],
@@ -852,19 +887,8 @@ mod tests {
                     }),
                 ),
             ];
-            let instruction_accounts: Vec<InstructionAccount> = [1, 1, 2, 3, 4, 4, 5, 6]
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(index_in_instruction, index_in_transaction)| InstructionAccount {
-                        index_in_transaction,
-                        index_in_caller: index_in_transaction,
-                        index_in_callee: index_in_transaction - 1,
-                        is_signer: false,
-                        is_writable: index_in_instruction >= 4,
-                    },
-                )
-                .collect();
+            let instruction_accounts =
+                deduplicated_instruction_accounts(&[1, 1, 2, 3, 4, 4, 5, 6], |index| index >= 4);
             let instruction_data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
             let program_indices = [0];
             let mut original_accounts = transaction_accounts.clone();
@@ -885,6 +909,7 @@ mod tests {
                 invoke_context.transaction_context,
                 instruction_context,
                 copy_account_data,
+                true, // mask_out_rent_epoch_in_vm_serialization
             )
             .unwrap();
 
@@ -917,14 +942,14 @@ mod tests {
                     .unwrap();
                 let account = invoke_context
                     .transaction_context
-                    .get_account_at_index(index_in_transaction)
-                    .unwrap()
-                    .borrow();
+                    .accounts()
+                    .try_borrow(index_in_transaction)
+                    .unwrap();
                 assert_eq!(account.lamports(), account_info.lamports());
                 assert_eq!(account.data(), &account_info.data.borrow()[..]);
                 assert_eq!(account.owner(), account_info.owner);
                 assert_eq!(account.executable(), account_info.executable);
-                assert_eq!(account.rent_epoch(), account_info.rent_epoch);
+                assert_eq!(u64::MAX, account_info.rent_epoch);
 
                 assert_eq!(
                     (*account_info.lamports.borrow() as *const u64).align_offset(BPF_ALIGN_OF_U128),
@@ -953,9 +978,9 @@ mod tests {
             {
                 let account = invoke_context
                     .transaction_context
-                    .get_account_at_index(index_in_transaction as IndexOfAccount)
-                    .unwrap()
-                    .borrow();
+                    .accounts()
+                    .try_borrow(index_in_transaction as IndexOfAccount)
+                    .unwrap();
                 assert_eq!(&*account, original_account);
             }
 
@@ -969,13 +994,15 @@ mod tests {
                 .transaction_context
                 .get_account_at_index(0)
                 .unwrap()
-                .borrow_mut()
+                .try_borrow_mut()
+                .unwrap()
                 .set_owner(bpf_loader_deprecated::id());
 
             let (mut serialized, regions, account_lengths) = serialize_parameters(
                 invoke_context.transaction_context,
                 instruction_context,
                 copy_account_data,
+                true, // mask_out_rent_epoch_in_vm_serialization
             )
             .unwrap();
             let mut serialized_regions = concat_regions(&regions);
@@ -1000,14 +1027,14 @@ mod tests {
                     .unwrap();
                 let account = invoke_context
                     .transaction_context
-                    .get_account_at_index(index_in_transaction)
-                    .unwrap()
-                    .borrow();
+                    .accounts()
+                    .try_borrow(index_in_transaction)
+                    .unwrap();
                 assert_eq!(account.lamports(), account_info.lamports());
                 assert_eq!(account.data(), &account_info.data.borrow()[..]);
                 assert_eq!(account.owner(), account_info.owner);
                 assert_eq!(account.executable(), account_info.executable);
-                assert_eq!(account.rent_epoch(), account_info.rent_epoch);
+                assert_eq!(u64::MAX, account_info.rent_epoch);
             }
 
             deserialize_parameters(
@@ -1023,17 +1050,189 @@ mod tests {
             {
                 let account = invoke_context
                     .transaction_context
-                    .get_account_at_index(index_in_transaction as IndexOfAccount)
-                    .unwrap()
-                    .borrow();
+                    .accounts()
+                    .try_borrow(index_in_transaction as IndexOfAccount)
+                    .unwrap();
                 assert_eq!(&*account, original_account);
+            }
+        }
+    }
+
+    #[test]
+    fn test_serialize_parameters_mask_out_rent_epoch_in_vm_serialization() {
+        for mask_out_rent_epoch_in_vm_serialization in [false, true] {
+            let transaction_accounts = vec![
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 0,
+                        data: vec![],
+                        owner: bpf_loader::id(),
+                        executable: true,
+                        rent_epoch: 0,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 1,
+                        data: vec![1u8, 2, 3, 4, 5],
+                        owner: bpf_loader::id(),
+                        executable: false,
+                        rent_epoch: 100,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 2,
+                        data: vec![11u8, 12, 13, 14, 15, 16, 17, 18, 19],
+                        owner: bpf_loader::id(),
+                        executable: true,
+                        rent_epoch: 200,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 3,
+                        data: vec![],
+                        owner: bpf_loader::id(),
+                        executable: false,
+                        rent_epoch: 300,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 4,
+                        data: vec![1u8, 2, 3, 4, 5],
+                        owner: bpf_loader::id(),
+                        executable: false,
+                        rent_epoch: 100,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 5,
+                        data: vec![11u8, 12, 13, 14, 15, 16, 17, 18, 19],
+                        owner: bpf_loader::id(),
+                        executable: true,
+                        rent_epoch: 200,
+                    }),
+                ),
+                (
+                    solana_pubkey::new_rand(),
+                    AccountSharedData::from(Account {
+                        lamports: 6,
+                        data: vec![],
+                        owner: bpf_loader::id(),
+                        executable: false,
+                        rent_epoch: 3100,
+                    }),
+                ),
+            ];
+            let instruction_accounts =
+                deduplicated_instruction_accounts(&[1, 1, 2, 3, 4, 4, 5, 6], |index| index >= 4);
+            let instruction_data = vec![];
+            let program_indices = [0];
+            let mut original_accounts = transaction_accounts.clone();
+            with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
+            invoke_context
+                .transaction_context
+                .get_next_instruction_context()
+                .unwrap()
+                .configure(&program_indices, &instruction_accounts, &instruction_data);
+            invoke_context.push().unwrap();
+            let instruction_context = invoke_context
+                .transaction_context
+                .get_current_instruction_context()
+                .unwrap();
+
+            // check serialize_parameters_aligned
+            let (_serialized, regions, _accounts_metadata) = serialize_parameters(
+                invoke_context.transaction_context,
+                instruction_context,
+                true,
+                mask_out_rent_epoch_in_vm_serialization,
+            )
+            .unwrap();
+
+            let mut serialized_regions = concat_regions(&regions);
+            let (_de_program_id, de_accounts, _de_instruction_data) = unsafe {
+                deserialize(serialized_regions.as_slice_mut().first_mut().unwrap() as *mut u8)
+            };
+
+            for account_info in de_accounts {
+                let index_in_transaction = invoke_context
+                    .transaction_context
+                    .find_index_of_account(account_info.key)
+                    .unwrap();
+                let account = invoke_context
+                    .transaction_context
+                    .accounts()
+                    .try_borrow(index_in_transaction)
+                    .unwrap();
+                let expected_rent_epoch = if mask_out_rent_epoch_in_vm_serialization {
+                    u64::MAX
+                } else {
+                    account.rent_epoch()
+                };
+                assert_eq!(expected_rent_epoch, account_info.rent_epoch);
+            }
+
+            // check serialize_parameters_unaligned
+            original_accounts
+                .first_mut()
+                .unwrap()
+                .1
+                .set_owner(bpf_loader_deprecated::id());
+            invoke_context
+                .transaction_context
+                .get_account_at_index(0)
+                .unwrap()
+                .try_borrow_mut()
+                .unwrap()
+                .set_owner(bpf_loader_deprecated::id());
+
+            let (_serialized, regions, _account_lengths) = serialize_parameters(
+                invoke_context.transaction_context,
+                instruction_context,
+                true,
+                mask_out_rent_epoch_in_vm_serialization,
+            )
+            .unwrap();
+            let mut serialized_regions = concat_regions(&regions);
+
+            let (_de_program_id, de_accounts, _de_instruction_data) = unsafe {
+                deserialize_unaligned(
+                    serialized_regions.as_slice_mut().first_mut().unwrap() as *mut u8
+                )
+            };
+            for account_info in de_accounts {
+                let index_in_transaction = invoke_context
+                    .transaction_context
+                    .find_index_of_account(account_info.key)
+                    .unwrap();
+                let account = invoke_context
+                    .transaction_context
+                    .accounts()
+                    .try_borrow(index_in_transaction)
+                    .unwrap();
+                let expected_rent_epoch = if mask_out_rent_epoch_in_vm_serialization {
+                    u64::MAX
+                } else {
+                    account.rent_epoch()
+                };
+                assert_eq!(expected_rent_epoch, account_info.rent_epoch);
             }
         }
     }
 
     // the old bpf_loader in-program deserializer bpf_loader::id()
     #[deny(unsafe_op_in_unsafe_fn)]
-    pub unsafe fn deserialize_unaligned<'a>(
+    unsafe fn deserialize_unaligned<'a>(
         input: *mut u8,
     ) -> (&'a Pubkey, Vec<AccountInfo<'a>>, &'a [u8]) {
         // this boring boilerplate struct is needed until inline const...

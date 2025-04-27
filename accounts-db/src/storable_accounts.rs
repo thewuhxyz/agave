@@ -5,10 +5,10 @@ use {
         accounts_db::{AccountFromStorage, AccountStorageEntry, AccountsDb},
         accounts_index::ZeroLamport,
     },
+    solana_pubkey::Pubkey,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         clock::{Epoch, Slot},
-        pubkey::Pubkey,
     },
     std::sync::{Arc, RwLock},
 };
@@ -32,7 +32,7 @@ impl<'a> From<&'a StoredAccountMeta<'a>> for AccountForStorage<'a> {
     }
 }
 
-impl<'a> ZeroLamport for AccountForStorage<'a> {
+impl ZeroLamport for AccountForStorage<'_> {
     fn is_zero_lamport(&self) -> bool {
         self.lamports() == 0
     }
@@ -47,7 +47,7 @@ impl<'a> AccountForStorage<'a> {
     }
 }
 
-impl<'a> ReadableAccount for AccountForStorage<'a> {
+impl ReadableAccount for AccountForStorage<'_> {
     fn lamports(&self) -> u64 {
         match self {
             AccountForStorage::AddressAndAccount((_pubkey, account)) => account.lamports(),
@@ -100,7 +100,8 @@ pub struct StorableAccountsCacher {
 
 /// abstract access to pubkey, account, slot, target_slot of either:
 /// a. (slot, &[&Pubkey, &ReadableAccount])
-/// b. (slot, &[&Pubkey, &ReadableAccount, Slot]) (we will use this later)
+/// b. (slot, &[Pubkey, ReadableAccount])
+/// c. (slot, &[&Pubkey, &ReadableAccount, Slot]) (we will use this later)
 /// This trait avoids having to allocate redundant data when there is a duplicated slot parameter.
 /// All legacy callers do not have a unique slot per account to store.
 pub trait StorableAccounts<'a>: Sync {
@@ -110,6 +111,10 @@ pub trait StorableAccounts<'a>: Sync {
         index: usize,
         callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
     ) -> Ret;
+    /// whether account at 'index' has zero lamports
+    fn is_zero_lamport(&self, index: usize) -> bool;
+    /// data length of account at 'index'
+    fn data_len(&self, index: usize) -> usize;
     /// None if account is zero lamports
     fn account_default_if_zero_lamport<Ret>(
         &self,
@@ -152,6 +157,38 @@ impl<'a: 'b, 'b> StorableAccounts<'a> for (Slot, &'b [(&'a Pubkey, &'a AccountSh
         mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
     ) -> Ret {
         callback((self.1[index].0, self.1[index].1).into())
+    }
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        self.1[index].1.is_zero_lamport()
+    }
+    fn data_len(&self, index: usize) -> usize {
+        self.1[index].1.data().len()
+    }
+    fn slot(&self, _index: usize) -> Slot {
+        // per-index slot is not unique per slot when per-account slot is not included in the source data
+        self.target_slot()
+    }
+    fn target_slot(&self) -> Slot {
+        self.0
+    }
+    fn len(&self) -> usize {
+        self.1.len()
+    }
+}
+
+impl<'a: 'b, 'b> StorableAccounts<'a> for (Slot, &'b [(Pubkey, AccountSharedData)]) {
+    fn account<Ret>(
+        &self,
+        index: usize,
+        mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
+    ) -> Ret {
+        callback((&self.1[index].0, &self.1[index].1).into())
+    }
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        self.1[index].1.is_zero_lamport()
+    }
+    fn data_len(&self, index: usize) -> usize {
+        self.1[index].1.data().len()
     }
     fn slot(&self, _index: usize) -> Slot {
         // per-index slot is not unique per slot when per-account slot is not included in the source data
@@ -273,6 +310,14 @@ impl<'a> StorableAccounts<'a> for StorableAccountsBySlot<'a> {
         writer.storage = Some(storage);
         ret
     }
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        let indexes = self.find_internal_index(index);
+        self.slots_and_accounts[indexes.0].1[indexes.1].is_zero_lamport()
+    }
+    fn data_len(&self, index: usize) -> usize {
+        let indexes = self.find_internal_index(index);
+        self.slots_and_accounts[indexes.0].1[indexes.1].data_len()
+    }
     fn slot(&self, index: usize) -> Slot {
         let indexes = self.find_internal_index(index);
         self.slots_and_accounts[indexes.0].0
@@ -318,6 +363,12 @@ pub mod tests {
         ) -> Ret {
             callback(self.1[index].into())
         }
+        fn is_zero_lamport(&self, index: usize) -> bool {
+            self.1[index].is_zero_lamport()
+        }
+        fn data_len(&self, index: usize) -> usize {
+            self.1[index].data_len()
+        }
         fn slot(&self, _index: usize) -> Slot {
             // per-index slot is not unique per slot when per-account slot is not included in the source data
             self.0
@@ -342,6 +393,12 @@ pub mod tests {
         ) -> Ret {
             callback((&self.1[index].0, &self.1[index].1).into())
         }
+        fn is_zero_lamport(&self, index: usize) -> bool {
+            self.1[index].1.lamports() == 0
+        }
+        fn data_len(&self, index: usize) -> usize {
+            self.1[index].1.data().len()
+        }
         fn slot(&self, _index: usize) -> Slot {
             // per-index slot is not unique per slot when per-account slot is not included in the source data
             self.target_slot()
@@ -364,6 +421,12 @@ pub mod tests {
             mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
         ) -> Ret {
             callback(self.1[index].into())
+        }
+        fn is_zero_lamport(&self, index: usize) -> bool {
+            self.1[index].is_zero_lamport()
+        }
+        fn data_len(&self, index: usize) -> usize {
+            self.1[index].data_len()
         }
         fn slot(&self, _index: usize) -> Slot {
             // same other slot for all accounts
@@ -528,7 +591,7 @@ pub mod tests {
                             .for_each(|(account, offset)| {
                                 account.index_info = AccountInfo::new(
                                     StorageLocation::AppendVec(0, *offset),
-                                    if account.is_zero_lamport() { 0 } else { 1 },
+                                    account.is_zero_lamport(),
                                 )
                             });
                     }
@@ -667,7 +730,7 @@ pub mod tests {
                                             |(account, offset)| {
                                                 account.index_info = AccountInfo::new(
                                                     StorageLocation::AppendVec(0, *offset),
-                                                    if account.is_zero_lamport() { 0 } else { 1 },
+                                                    account.is_zero_lamport(),
                                                 )
                                             },
                                         );

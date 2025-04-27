@@ -27,7 +27,8 @@ use {
     solana_perf::thread::renice_this_thread,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::{
-        bank_forks::BankForks, commitment::BlockCommitmentCache,
+        bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache,
+        non_circulating_supply::calculate_non_circulating_supply,
         prioritization_fee_cache::PrioritizationFeeCache,
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
         snapshot_utils,
@@ -36,7 +37,10 @@ use {
         exit::Exit, genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, hash::Hash,
         native_token::lamports_to_sol,
     },
-    solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
+    solana_send_transaction_service::{
+        send_transaction_service::{self, SendTransactionService},
+        transaction_client::ConnectionCacheClient,
+    },
     solana_storage_bigtable::CredentialType,
     std::{
         net::SocketAddr,
@@ -287,12 +291,8 @@ impl RequestMiddleware for RpcRequestMiddleware {
             }
         }
 
-        if let Some(result) = process_rest(&self.bank_forks, request.uri().path()) {
-            hyper::Response::builder()
-                .status(hyper::StatusCode::OK)
-                .body(hyper::Body::from(result))
-                .unwrap()
-                .into()
+        if let Some(path) = match_supply_path(request.uri().path()) {
+            process_rest(&self.bank_forks, path)
         } else if self.is_file_get_path(request.uri().path()) {
             self.process_file_get(request.uri().path())
         } else if request.uri().path() == "/health" {
@@ -307,19 +307,39 @@ impl RequestMiddleware for RpcRequestMiddleware {
     }
 }
 
-fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<String> {
+fn match_supply_path(path: &str) -> Option<&str> {
+    match path {
+        "/v0/circulating-supply" | "/v0/total-supply" => Some(path),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub enum SupplyCalcError {
+    Scan(String),
+}
+
+async fn calculate_circulating_supply_async(bank: &Arc<Bank>) -> Result<u64, SupplyCalcError> {
+    let total_supply = bank.capitalization();
+    let bank = Arc::clone(bank);
+    let non_circulating_supply =
+        tokio::task::spawn_blocking(move || calculate_non_circulating_supply(&bank))
+            .await
+            .expect("Failed to spawn blocking task")
+            .map_err(|e| SupplyCalcError::Scan(e.to_string()))?;
+
+    Ok(total_supply.saturating_sub(non_circulating_supply.lamports))
+}
+
+async fn handle_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<String> {
     match path {
         "/v0/circulating-supply" => {
             let bank = bank_forks.read().unwrap().root_bank();
-            let total_supply = bank.capitalization();
-            let non_circulating_supply =
-                solana_runtime::non_circulating_supply::calculate_non_circulating_supply(&bank)
-                    .expect("Scan should not error on root banks")
-                    .lamports;
-            Some(format!(
-                "{}",
-                lamports_to_sol(total_supply - non_circulating_supply)
-            ))
+            let supply_result = calculate_circulating_supply_async(&bank).await;
+            match supply_result {
+                Ok(supply) => Some(format!("{}", lamports_to_sol(supply))),
+                Err(_) => None,
+            }
         }
         "/v0/total-supply" => {
             let bank = bank_forks.read().unwrap().root_bank();
@@ -327,6 +347,25 @@ fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<Strin
             Some(format!("{}", lamports_to_sol(total_supply)))
         }
         _ => None,
+    }
+}
+
+fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> RequestMiddlewareAction {
+    let bank_forks = bank_forks.clone();
+    let path = path.to_string();
+
+    RequestMiddlewareAction::Respond {
+        should_validate_hosts: true,
+        response: Box::pin(async move {
+            let result = handle_rest(&bank_forks, path.as_str()).await;
+            match result {
+                Some(s) => Ok(hyper::Response::builder()
+                    .status(hyper::StatusCode::OK)
+                    .body(hyper::Body::from(s))
+                    .unwrap()),
+                None => Ok(RpcRequestMiddleware::not_found()),
+            }
+        }),
     }
 }
 
@@ -359,6 +398,7 @@ impl JsonRpcService {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
         let rpc_threads = 1.max(config.rpc_threads);
+        let rpc_blocking_threads = 1.max(config.rpc_blocking_threads);
         let rpc_niceness_adj = config.rpc_niceness_adj;
 
         let health = Arc::new(RpcHealth::new(
@@ -376,23 +416,14 @@ impl JsonRpcService {
         let tpu_address = cluster_info
             .my_contact_info()
             .tpu(connection_cache.protocol())
-            .map_err(|err| format!("{err}"))?;
+            .ok_or_else(|| {
+                format!(
+                    "Invalid {:?} socket address for TPU",
+                    connection_cache.protocol()
+                )
+            })?;
 
-        // sadly, some parts of our current rpc implemention block the jsonrpc's
-        // _socket-listening_ event loop for too long, due to (blocking) long IO or intesive CPU,
-        // causing no further processing of incoming requests and ultimatily innocent clients timing-out.
-        // So create a (shared) multi-threaded event_loop for jsonrpc and set its .threads() to 1,
-        // so that we avoid the single-threaded event loops from being created automatically by
-        // jsonrpc for threads when .threads(N > 1) is given.
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(rpc_threads)
-                .on_thread_start(move || renice_this_thread(rpc_niceness_adj).unwrap())
-                .thread_name("solRpcEl")
-                .enable_all()
-                .build()
-                .expect("Runtime"),
-        );
+        let runtime = service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj);
 
         let exit_bigtable_ledger_upload_service = Arc::new(AtomicBool::new(false));
 
@@ -470,16 +501,22 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             max_complete_rewards_slot,
             prioritization_fee_cache,
+            Arc::clone(&runtime),
         );
 
         let leader_info =
             poh_recorder.map(|recorder| ClusterTpuInfo::new(cluster_info.clone(), recorder));
-        let _send_transaction_service = Arc::new(SendTransactionService::new_with_config(
-            tpu_address,
-            &bank_forks,
-            leader_info,
-            receiver,
+        let client = ConnectionCacheClient::new(
             connection_cache,
+            tpu_address,
+            send_transaction_service_config.tpu_peers.clone(),
+            leader_info,
+            send_transaction_service_config.leader_forward_count,
+        );
+        let _send_transaction_service = Arc::new(SendTransactionService::new_with_client(
+            &bank_forks,
+            receiver,
+            client,
             send_transaction_service_config,
             exit,
         ));
@@ -576,6 +613,40 @@ impl JsonRpcService {
         self.exit();
         self.thread_hdl.join()
     }
+}
+
+pub fn service_runtime(
+    rpc_threads: usize,
+    rpc_blocking_threads: usize,
+    rpc_niceness_adj: i8,
+) -> Arc<tokio::runtime::Runtime> {
+    // The jsonrpc_http_server crate supports two execution models:
+    //
+    // - By default, it spawns a number of threads - configured with .threads(N) - and runs a
+    //   single-threaded futures executor in each thread.
+    // - Alternatively when configured with .event_loop_executor(executor) and .threads(1),
+    //   it executes all the tasks on the given executor, not spawning any extra internal threads.
+    //
+    // We use the latter configuration, using a multi threaded tokio runtime as the executor. We
+    // do this so we can configure the number of worker threads, the number of blocking threads
+    // and then use tokio::task::spawn_blocking() to avoid blocking the worker threads on CPU
+    // bound operations like getMultipleAccounts. This results in reduced latency, since fast
+    // rpc calls (the majority) are not blocked by slow CPU bound ones.
+    //
+    // NB: `rpc_blocking_threads` shouldn't be set too high (defaults to num_cpus / 2). Too many
+    // (busy) blocking threads could compete with CPU time with other validator threads and
+    // negatively impact performance.
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(rpc_threads)
+            .max_blocking_threads(rpc_blocking_threads)
+            .on_thread_start(move || renice_this_thread(rpc_niceness_adj).unwrap())
+            .thread_name("solRpcEl")
+            .enable_all()
+            .build()
+            .expect("Runtime"),
+    );
+    runtime
 }
 
 #[cfg(test)]
@@ -679,12 +750,25 @@ mod tests {
     #[test]
     fn test_process_rest_api() {
         let bank_forks = create_bank_forks();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
 
-        assert_eq!(None, process_rest(&bank_forks, "not-a-supported-rest-api"));
-        assert_eq!(
-            process_rest(&bank_forks, "/v0/circulating-supply"),
-            process_rest(&bank_forks, "/v0/total-supply")
-        );
+        runtime.block_on(async {
+            assert_eq!(
+                None,
+                handle_rest(&bank_forks, "not-a-supported-rest-api").await
+            );
+
+            let circulating_supply = handle_rest(&bank_forks, "/v0/circulating-supply").await;
+            assert!(circulating_supply.is_some());
+
+            let total_supply = handle_rest(&bank_forks, "/v0/total-supply").await;
+            assert!(total_supply.is_some());
+
+            assert_eq!(
+                handle_rest(&bank_forks, "/v0/circulating-supply").await,
+                handle_rest(&bank_forks, "/v0/total-supply").await
+            );
+        });
     }
 
     #[test]

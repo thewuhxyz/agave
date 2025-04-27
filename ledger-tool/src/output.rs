@@ -4,6 +4,7 @@ use {
         ledger_utils::get_program_ids,
     },
     chrono::{Local, TimeZone},
+    itertools::Either,
     serde::ser::{Impossible, SerializeSeq, SerializeStruct, Serializer},
     serde_derive::{Deserialize, Serialize},
     solana_account_decoder::{encode_ui_account, UiAccountData, UiAccountEncoding},
@@ -15,7 +16,7 @@ use {
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreError},
         blockstore_meta::{DuplicateSlotProof, ErasureMeta},
-        shred::{Shred, ShredType},
+        shred::{self, Shred, ShredType},
     },
     solana_runtime::bank::{Bank, TotalAccountsStats},
     solana_sdk::{
@@ -361,6 +362,7 @@ pub struct CliDuplicateShred {
     merkle_root: Option<Hash>,
     chained_merkle_root: Option<Hash>,
     last_in_slot: bool,
+    #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
 }
 
@@ -406,7 +408,7 @@ impl From<Shred> for CliDuplicateShred {
             merkle_root: shred.merkle_root().ok(),
             chained_merkle_root: shred.chained_merkle_root().ok(),
             last_in_slot: shred.last_in_slot(),
-            payload: shred.payload().clone(),
+            payload: shred::Payload::unwrap_or_clone(shred.payload().clone()),
         }
     }
 }
@@ -513,15 +515,15 @@ pub struct BlockWithoutMetadata {
 }
 
 impl BlockContents {
-    pub fn transactions(&self) -> Box<dyn Iterator<Item = &VersionedTransaction> + '_> {
+    pub fn transactions(&self) -> impl Iterator<Item = &VersionedTransaction> {
         match self {
-            BlockContents::VersionedConfirmedBlock(block) => Box::new(
+            BlockContents::VersionedConfirmedBlock(block) => Either::Left(
                 block
                     .transactions
                     .iter()
                     .map(|VersionedTransactionWithStatusMeta { transaction, .. }| transaction),
             ),
-            BlockContents::BlockWithoutMetadata(block) => Box::new(block.transactions.iter()),
+            BlockContents::BlockWithoutMetadata(block) => Either::Right(block.transactions.iter()),
         }
     }
 }

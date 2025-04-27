@@ -12,6 +12,8 @@ use {
         },
         program::*,
     },
+    agave_feature_set::{self as feature_set, FeatureSet},
+    agave_reserved_account_keys::ReservedAccountKeys,
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App,
         AppSettings, Arg, ArgMatches, SubCommand,
@@ -33,10 +35,9 @@ use {
     solana_core::{
         banking_simulation::{BankingSimulator, BankingTraceEvents},
         system_monitor_service::{SystemMonitorService, SystemMonitorStatsReportConfig},
-        validator::{BlockProductionMethod, BlockVerificationMethod},
+        validator::{BlockProductionMethod, BlockVerificationMethod, TransactionStructure},
     },
     solana_cost_model::{cost_model::CostModel, cost_tracker::CostTracker},
-    solana_feature_set::{self as feature_set, FeatureSet},
     solana_ledger::{
         blockstore::{banking_trace_path, create_new_ledger, Blockstore},
         blockstore_options::{AccessType, LedgerColumnOptions},
@@ -70,7 +71,6 @@ use {
         native_token::{lamports_to_sol, sol_to_lamports, Sol},
         pubkey::Pubkey,
         rent::Rent,
-        reserved_account_keys::ReservedAccountKeys,
         shred_version::compute_shred_version,
         stake::{self, state::StakeStateV2},
         system_program,
@@ -796,10 +796,10 @@ fn record_transactions(
     }
 }
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 use jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -1137,29 +1137,6 @@ fn main() {
                         ),
                 )
                 .arg(
-                    Arg::with_name("partitioned_epoch_rewards_compare_calculation")
-                        .long("partitioned-epoch-rewards-compare-calculation")
-                        .takes_value(false)
-                        .help(
-                            "Do normal epoch rewards distribution, but also calculate rewards \
-                             using the partitioned rewards code path and compare the resulting \
-                             vote and stake accounts",
-                        )
-                        .hidden(hidden_unless_forced()),
-                )
-                .arg(
-                    Arg::with_name("partitioned_epoch_rewards_force_enable_single_slot")
-                        .long("partitioned-epoch-rewards-force-enable-single-slot")
-                        .takes_value(false)
-                        .help(
-                            "Force the partitioned rewards distribution, but distribute all \
-                             rewards in the first slot in the epoch. This should match consensus \
-                             with the normal rewards distribution.",
-                        )
-                        .conflicts_with("partitioned_epoch_rewards_compare_calculation")
-                        .hidden(hidden_unless_forced()),
-                )
-                .arg(
                     Arg::with_name("print_accounts_stats")
                         .long("print-accounts-stats")
                         .takes_value(false)
@@ -1470,6 +1447,20 @@ fn main() {
                         .takes_value(true)
                         .help("Snapshot archive format to use.")
                         .conflicts_with("no_snapshot"),
+                )
+                .arg(
+                    Arg::with_name("snapshot_zstd_compression_level")
+                        .long("snapshot-zstd-compression-level")
+                        .default_value("0")
+                        .value_name("LEVEL")
+                        .takes_value(true)
+                        .help("The compression level to use when archiving with zstd")
+                        .long_help(
+                            "The compression level to use when archiving with zstd. \
+                             Higher compression levels generally produce higher \
+                             compression ratio at the expense of speed and memory. \
+                             See the zstd manpage for more information."
+                        ),
                 )
                 .arg(
                     Arg::with_name("enable_capitalization_change")
@@ -1993,9 +1984,18 @@ fn main() {
                     let snapshot_archive_format = {
                         let archive_format_str =
                             value_t_or_exit!(arg_matches, "snapshot_archive_format", String);
-                        ArchiveFormat::from_cli_arg(&archive_format_str).unwrap_or_else(|| {
-                            panic!("Archive format not recognized: {archive_format_str}")
-                        })
+                        let mut archive_format = ArchiveFormat::from_cli_arg(&archive_format_str)
+                            .unwrap_or_else(|| {
+                                panic!("Archive format not recognized: {archive_format_str}")
+                            });
+                        if let ArchiveFormat::TarZstd { config } = &mut archive_format {
+                            config.compression_level = value_t_or_exit!(
+                                arg_matches,
+                                "snapshot_zstd_compression_level",
+                                i32
+                            );
+                        }
+                        archive_format
                     };
 
                     let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
@@ -2101,7 +2101,7 @@ fn main() {
                         .accounts
                         .accounts_db
                         .verify_accounts_hash_in_bg
-                        .wait_for_complete();
+                        .join_background_thread();
 
                     let child_bank_required = rent_burn_percentage.is_ok()
                         || hashes_per_tick.is_some()
@@ -2130,6 +2130,36 @@ fn main() {
                                 _ => Some(value_t_or_exit!(arg_matches, "hashes_per_tick", u64)),
                             });
                         }
+
+                        for address in feature_gates_to_deactivate {
+                            let mut account =
+                                child_bank.get_account(&address).unwrap_or_else(|| {
+                                    eprintln!(
+                                        "Error: Feature-gate account does not exist, unable to \
+                                         deactivate it: {address}"
+                                    );
+                                    exit(1);
+                                });
+
+                            match feature::from_account(&account) {
+                                Some(feature) => {
+                                    if feature.activated_at.is_none() {
+                                        warn!("Feature gate is not yet activated: {address}");
+                                    } else {
+                                        child_bank.deactivate_feature(&address);
+                                    }
+                                }
+                                None => {
+                                    eprintln!("Error: Account is not a `Feature`: {address}");
+                                    exit(1);
+                                }
+                            }
+
+                            account.set_lamports(0);
+                            child_bank.store_account(&address, &account);
+                            debug!("Feature gate deactivated: {address}");
+                        }
+
                         bank = Arc::new(child_bank);
                     }
 
@@ -2162,32 +2192,6 @@ fn main() {
                         account.set_lamports(0);
                         bank.store_account(&address, &account);
                         debug!("Account removed: {address}");
-                    }
-
-                    for address in feature_gates_to_deactivate {
-                        let mut account = bank.get_account(&address).unwrap_or_else(|| {
-                            eprintln!(
-                                "Error: Feature-gate account does not exist, unable to \
-                                     deactivate it: {address}"
-                            );
-                            exit(1);
-                        });
-
-                        match feature::from_account(&account) {
-                            Some(feature) => {
-                                if feature.activated_at.is_none() {
-                                    warn!("Feature gate is not yet activated: {address}");
-                                }
-                            }
-                            None => {
-                                eprintln!("Error: Account is not a `Feature`: {address}");
-                                exit(1);
-                            }
-                        }
-
-                        account.set_lamports(0);
-                        bank.store_account(&address, &account);
-                        debug!("Feature gate deactivated: {address}");
                     }
 
                     if !vote_accounts_to_destake.is_empty() {
@@ -2515,14 +2519,18 @@ fn main() {
                         BlockProductionMethod
                     )
                     .unwrap_or_default();
+                    let transaction_struct =
+                        value_t!(arg_matches, "transaction_struct", TransactionStructure)
+                            .unwrap_or_default();
 
-                    info!("Using: block-production-method: {block_production_method}");
+                    info!("Using: block-production-method: {block_production_method} transaction-structure: {transaction_struct}");
 
                     match simulator.start(
                         genesis_config,
                         bank_forks,
                         blockstore,
                         block_production_method,
+                        transaction_struct,
                     ) {
                         Ok(()) => println!("Ok"),
                         Err(error) => {

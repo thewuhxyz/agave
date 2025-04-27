@@ -1,24 +1,22 @@
 use {
     crate::{bank::Bank, prioritization_fee::*},
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError},
     log::*,
     solana_accounts_db::account_locks::validate_account_locks,
     solana_measure::measure_us,
-    solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
-    },
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_sdk::{
         clock::{BankId, Slot},
         pubkey::Pubkey,
     },
-    solana_svm_transaction::svm_message::SVMMessage,
     std::{
         collections::{BTreeMap, HashMap},
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc, RwLock,
         },
-        thread::{Builder, JoinHandle},
+        thread::{sleep, Builder, JoinHandle},
+        time::Duration,
     },
 };
 
@@ -196,10 +194,10 @@ impl PrioritizationFeeCache {
     /// Update with a list of non-vote transactions' compute_budget_details and account_locks; Only
     /// transactions have both valid compute_budget_details and account_locks will be used to update
     /// fee_cache asynchronously.
-    pub fn update<'a, Tx: SVMMessage + 'a>(
+    pub fn update<'a, Tx: TransactionWithMeta + 'a>(
         &self,
         bank: &Bank,
-        txs: impl Iterator<Item = &'a RuntimeTransaction<Tx>>,
+        txs: impl Iterator<Item = &'a Tx>,
     ) {
         let (_, send_updates_us) = measure_us!({
             for sanitized_transaction in txs {
@@ -209,8 +207,9 @@ impl PrioritizationFeeCache {
                     continue;
                 }
 
-                let compute_budget_limits =
-                    sanitized_transaction.compute_budget_limits(&bank.feature_set);
+                let compute_budget_limits = sanitized_transaction
+                    .compute_budget_instruction_details()
+                    .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set);
 
                 let lock_result = validate_account_locks(
                     sanitized_transaction.account_keys(),
@@ -361,7 +360,18 @@ impl PrioritizationFeeCache {
         // for a slot. The updates are tracked and finalized by bank_id.
         let mut unfinalized = UnfinalizedPrioritizationFees::new();
 
-        for update in receiver.iter() {
+        loop {
+            let update = match receiver.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => {
+                    sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err @ TryRecvError::Disconnected) => {
+                    info!("PrioritizationFeeCache::service_loop() is stopping because: {err}");
+                    break;
+                }
+            };
             match update {
                 CacheServiceUpdate::TransactionUpdate {
                     slot,
@@ -430,6 +440,7 @@ mod tests {
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
         },
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk::{
             compute_budget::ComputeBudgetInstruction,
             message::Message,
@@ -557,7 +568,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
 
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
         sync_update(
@@ -609,7 +620,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
         let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 2));
         let bank3 = Arc::new(Bank::new_from_parent(bank, &collector, 3));
@@ -861,7 +872,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
         let slot: Slot = 999;
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, slot));
         let bank2 = Arc::new(Bank::new_from_parent(bank, &collector, slot + 1));

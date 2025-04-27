@@ -3,6 +3,7 @@
 
 use {
     crate::snapshot_utils::create_tmp_accounts_dir_for_tests,
+    agave_feature_set as feature_set,
     log::*,
     solana_accounts_db::{
         accounts_db::CalcAccountsHashDataSource, accounts_hash::CalcAccountsHashConfig,
@@ -102,6 +103,13 @@ impl TestEnvironment {
         );
         genesis_config_info.genesis_config.epoch_schedule =
             EpochSchedule::custom(Self::SLOTS_PER_EPOCH, Self::SLOTS_PER_EPOCH, false);
+        // When the accounts lt hash feature is enabled, the EAH is *disabled*.
+        // Disable the accounts lt hash feature by removing its account from genesis.
+        genesis_config_info
+            .genesis_config
+            .accounts
+            .remove(&feature_set::accounts_lt_hash::id())
+            .unwrap();
         let snapshot_config = SnapshotConfig {
             full_snapshot_archives_dir: full_snapshot_archives_dir.path().to_path_buf(),
             incremental_snapshot_archives_dir: incremental_snapshot_archives_dir

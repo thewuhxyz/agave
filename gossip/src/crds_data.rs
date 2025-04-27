@@ -7,7 +7,7 @@ use {
         legacy_contact_info::LegacyContactInfo,
         restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
     },
-    rand::{CryptoRng, Rng},
+    rand::Rng,
     serde::de::{Deserialize, Deserializer},
     solana_sanitize::{Sanitize, SanitizeError},
     solana_sdk::{
@@ -116,22 +116,21 @@ pub(crate) fn new_rand_timestamp<R: Rng>(rng: &mut R) -> u64 {
 impl CrdsData {
     /// New random CrdsData for tests and benchmarks.
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> CrdsData {
-        let kind = rng.gen_range(0..9);
+        let kind = rng.gen_range(0..8);
         // TODO: Implement other kinds of CrdsData here.
         // TODO: Assign ranges to each arm proportional to their frequency in
         // the mainnet crds table.
         match kind {
-            0 => CrdsData::ContactInfo(ContactInfo::new_rand(rng, pubkey)),
+            0 => CrdsData::from(ContactInfo::new_rand(rng, pubkey)),
             // Index for LowestSlot is deprecated and should be zero.
             1 => CrdsData::LowestSlot(0, LowestSlot::new_rand(rng, pubkey)),
             2 => CrdsData::LegacySnapshotHashes(LegacySnapshotHashes::new_rand(rng, pubkey)),
             3 => CrdsData::AccountsHashes(AccountsHashes::new_rand(rng, pubkey)),
-            4 => CrdsData::Version(Version::new_rand(rng, pubkey)),
-            5 => CrdsData::Vote(rng.gen_range(0..MAX_VOTES), Vote::new_rand(rng, pubkey)),
-            6 => CrdsData::RestartLastVotedForkSlots(RestartLastVotedForkSlots::new_rand(
+            4 => CrdsData::Vote(rng.gen_range(0..MAX_VOTES), Vote::new_rand(rng, pubkey)),
+            5 => CrdsData::RestartLastVotedForkSlots(RestartLastVotedForkSlots::new_rand(
                 rng, pubkey,
             )),
-            7 => CrdsData::RestartHeaviestFork(RestartHeaviestFork::new_rand(rng, pubkey)),
+            6 => CrdsData::RestartHeaviestFork(RestartHeaviestFork::new_rand(rng, pubkey)),
             _ => CrdsData::EpochSlots(
                 rng.gen_range(0..MAX_EPOCH_SLOTS),
                 EpochSlots::new_rand(rng, pubkey),
@@ -175,6 +174,42 @@ impl CrdsData {
             CrdsData::RestartLastVotedForkSlots(slots) => slots.from,
             CrdsData::RestartHeaviestFork(fork) => fork.from,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_deprecated(&self) -> bool {
+        match self {
+            Self::LegacyContactInfo(_) => true,
+            Self::Vote(..) => false,
+            Self::LowestSlot(0, _) => false,
+            Self::LowestSlot(1.., _) => true,
+            Self::LegacySnapshotHashes(_) => true,
+            Self::AccountsHashes(_) => true,
+            Self::EpochSlots(..) => false,
+            Self::LegacyVersion(_) => true,
+            Self::Version(_) => true,
+            Self::NodeInstance(_) => true,
+            Self::DuplicateShred(..) => false,
+            Self::SnapshotHashes(_) => false,
+            Self::ContactInfo(_) => false,
+            Self::RestartLastVotedForkSlots(_) => false,
+            Self::RestartHeaviestFork(_) => false,
+        }
+    }
+}
+
+impl From<ContactInfo> for CrdsData {
+    #[inline]
+    fn from(node: ContactInfo) -> Self {
+        Self::ContactInfo(node)
+    }
+}
+
+impl From<&ContactInfo> for CrdsData {
+    #[inline]
+    fn from(node: &ContactInfo) -> Self {
+        Self::ContactInfo(node.clone())
     }
 }
 
@@ -374,7 +409,7 @@ impl<'de> Deserialize<'de> for Vote {
 pub(crate) struct LegacyVersion {
     from: Pubkey,
     wallclock: u64,
-    pub(crate) version: solana_version::LegacyVersion1,
+    version: solana_version::LegacyVersion1,
 }
 
 impl Sanitize for LegacyVersion {
@@ -390,7 +425,7 @@ impl Sanitize for LegacyVersion {
 pub(crate) struct Version {
     from: Pubkey,
     wallclock: u64,
-    pub(crate) version: solana_version::LegacyVersion2,
+    version: solana_version::LegacyVersion2,
 }
 
 impl Sanitize for Version {
@@ -398,31 +433,6 @@ impl Sanitize for Version {
         sanitize_wallclock(self.wallclock)?;
         self.from.sanitize()?;
         self.version.sanitize()
-    }
-}
-
-impl Version {
-    pub(crate) fn new(from: Pubkey) -> Self {
-        Self {
-            from,
-            wallclock: timestamp(),
-            version: solana_version::LegacyVersion2::default(),
-        }
-    }
-
-    /// New random Version for tests and benchmarks.
-    fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
-        Self {
-            from: pubkey.unwrap_or_else(pubkey::new_rand),
-            wallclock: new_rand_timestamp(rng),
-            version: solana_version::LegacyVersion2 {
-                major: rng.gen(),
-                minor: rng.gen(),
-                patch: rng.gen(),
-                commit: Some(rng.gen()),
-                feature_set: rng.gen(),
-            },
-        }
     }
 }
 
@@ -436,9 +446,10 @@ pub(crate) struct NodeInstance {
 }
 
 impl NodeInstance {
+    #[cfg(test)]
     pub(crate) fn new<R>(rng: &mut R, from: Pubkey, now: u64) -> Self
     where
-        R: Rng + CryptoRng,
+        R: Rng + rand::CryptoRng,
     {
         Self {
             from,
@@ -448,19 +459,10 @@ impl NodeInstance {
         }
     }
 
+    #[cfg(test)]
     // Clones the value with an updated wallclock.
     pub(crate) fn with_wallclock(&self, wallclock: u64) -> Self {
         Self { wallclock, ..*self }
-    }
-
-    // Returns true if the crds-value is a duplicate instance of this node,
-    // with a more recent timestamp.
-    // The older instance is considered the duplicate instance. If a staked
-    // node is restarted it will receive its old instance value from gossip.
-    // Considering the new instance as the duplicate would prevent the node
-    // from restarting.
-    pub(crate) fn check_duplicate(&self, other: &NodeInstance) -> bool {
-        self.token != other.token && self.timestamp <= other.timestamp && self.from == other.from
     }
 
     // Returns None if tokens are the same or other is not a node-instance from
@@ -540,7 +542,7 @@ mod test {
         let mut rng = rand::thread_rng();
         let keypair = Keypair::new();
         let vote = Vote::new(keypair.pubkey(), new_test_vote_tx(&mut rng), timestamp()).unwrap();
-        let vote = CrdsValue::new_signed(CrdsData::Vote(MAX_VOTES, vote), &keypair);
+        let vote = CrdsValue::new(CrdsData::Vote(MAX_VOTES, vote), &keypair);
         assert!(vote.sanitize().is_err());
     }
 
@@ -580,7 +582,7 @@ mod test {
     #[test]
     fn test_max_epoch_slots_index() {
         let keypair = Keypair::new();
-        let item = CrdsValue::new_signed(
+        let item = CrdsValue::new(
             CrdsData::EpochSlots(
                 MAX_EPOCH_SLOTS,
                 EpochSlots::new(keypair.pubkey(), timestamp()),
@@ -650,8 +652,6 @@ mod test {
             timestamp: now + 1,
             token: node.token,
         };
-        assert!(!node.check_duplicate(&other));
-        assert!(!other.check_duplicate(&node));
         assert_eq!(node.overrides(&other), None);
         assert_eq!(other.overrides(&node), None);
         // Older timestamp is not a duplicate.
@@ -661,8 +661,6 @@ mod test {
             timestamp: now - 1,
             token: rng.gen(),
         };
-        assert!(!node.check_duplicate(&other));
-        assert!(other.check_duplicate(&node));
         assert_eq!(node.overrides(&other), Some(true));
         assert_eq!(other.overrides(&node), Some(false));
         // Updated wallclock is not a duplicate.
@@ -676,8 +674,6 @@ mod test {
                 token: node.token,
             }
         );
-        assert!(!node.check_duplicate(&other));
-        assert!(!other.check_duplicate(&node));
         assert_eq!(node.overrides(&other), None);
         assert_eq!(other.overrides(&node), None);
         // Duplicate instance; tied timestamp.
@@ -688,8 +684,6 @@ mod test {
                 timestamp: now,
                 token: rng.gen(),
             };
-            assert!(node.check_duplicate(&other));
-            assert!(other.check_duplicate(&node));
             assert_eq!(node.overrides(&other), Some(other.token < node.token));
             assert_eq!(other.overrides(&node), Some(node.token < other.token));
         }
@@ -701,8 +695,6 @@ mod test {
                 timestamp: now + 1,
                 token: rng.gen(),
             };
-            assert!(node.check_duplicate(&other));
-            assert!(!other.check_duplicate(&node));
             assert_eq!(node.overrides(&other), Some(false));
             assert_eq!(other.overrides(&node), Some(true));
         }
@@ -713,8 +705,6 @@ mod test {
             timestamp: now + 1,
             token: rng.gen(),
         };
-        assert!(!node.check_duplicate(&other));
-        assert!(!other.check_duplicate(&node));
         assert_eq!(node.overrides(&other), None);
         assert_eq!(other.overrides(&node), None);
     }

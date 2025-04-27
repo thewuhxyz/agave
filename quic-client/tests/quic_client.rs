@@ -4,16 +4,16 @@ mod tests {
         crossbeam_channel::{unbounded, Receiver},
         log::*,
         solana_connection_cache::connection_cache_stats::ConnectionCacheStats,
+        solana_keypair::Keypair,
+        solana_net_utils::bind_to_localhost,
+        solana_packet::PACKET_DATA_SIZE,
         solana_perf::packet::PacketBatch,
-        solana_quic_client::nonblocking::quic_client::{
-            QuicClientCertificate, QuicLazyInitializedEndpoint,
-        },
-        solana_sdk::{packet::PACKET_DATA_SIZE, signature::Keypair},
+        solana_quic_client::nonblocking::quic_client::QuicLazyInitializedEndpoint,
         solana_streamer::{
             quic::{QuicServerParams, SpawnServerResult},
             streamer::StakedNodes,
-            tls_certificates::new_dummy_x509_certificate,
         },
+        solana_tls_utils::{new_dummy_x509_certificate, QuicClientCertificate},
         std::{
             net::{SocketAddr, UdpSocket},
             sync::{
@@ -52,7 +52,7 @@ mod tests {
 
     fn server_args() -> (UdpSocket, Arc<AtomicBool>, Keypair) {
         (
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            bind_to_localhost().unwrap(),
             Arc::new(AtomicBool::new(false)),
             Keypair::new(),
         )
@@ -84,6 +84,7 @@ mod tests {
                 max_connections_per_peer: 1,
                 max_staked_connections: 10,
                 max_unstaked_connections: 10,
+                coalesce_channel_size: 100_000, // smaller channel size for faster test
                 ..QuicServerParams::default()
             },
         )
@@ -170,6 +171,7 @@ mod tests {
                 max_staked_connections: 10,
                 max_unstaked_connections: 10,
                 wait_for_chunk_timeout: Duration::from_secs(1),
+                coalesce_channel_size: 100_000, // smaller channel size for faster test
                 ..QuicServerParams::default()
             },
         )
@@ -233,6 +235,7 @@ mod tests {
                 max_connections_per_peer: 1,
                 max_staked_connections: 10,
                 max_unstaked_connections: 10,
+                coalesce_channel_size: 100_000, // smaller channel size for faster test
                 ..QuicServerParams::default()
             },
         )
@@ -262,6 +265,7 @@ mod tests {
                 max_connections_per_peer: 1,
                 max_staked_connections: 10,
                 max_unstaked_connections: 10,
+                coalesce_channel_size: 100_000, // smaller channel size for faster test
                 ..QuicServerParams::default()
             },
         )

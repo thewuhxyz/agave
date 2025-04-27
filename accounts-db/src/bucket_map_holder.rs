@@ -9,10 +9,7 @@ use {
     },
     solana_bucket_map::bucket_map::{BucketMap, BucketMapConfig},
     solana_measure::measure::Measure,
-    solana_sdk::{
-        clock::{Slot, DEFAULT_MS_PER_SLOT},
-        timing::AtomicInterval,
-    },
+    solana_sdk::{clock::Slot, timing::AtomicInterval},
     std::{
         fmt::Debug,
         marker::PhantomData,
@@ -27,7 +24,11 @@ pub type Age = u8;
 pub type AtomicAge = AtomicU8;
 const _: () = assert!(std::mem::size_of::<Age>() == std::mem::size_of::<AtomicAge>());
 
-const AGE_MS: u64 = DEFAULT_MS_PER_SLOT; // match one age per slot time
+// - 400 milliseconds was causing excessive disk iops due to flushing the index to disk very often.
+// - 4 seconds was tried and showed a large reduction in disk iops, almost as good as when the disk
+//   index is entirely disabled!  But there were concerns about the in-mem index growth behavior.
+// - 2 seconds is much faster, and does also reduce disk iops quite a lot.
+const AGE_MS: u64 = 2_000;
 
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
@@ -35,7 +36,7 @@ pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>
     pub count_buckets_flushed: AtomicUsize,
 
     /// These three ages are individual atomics because their values are read many times from code during runtime.
-    /// Instead of accessing the single age and doing math each time, each value is incremented each time the age occurs, which is ~400ms.
+    /// Instead of accessing the single age and doing math each time, each value is incremented each time the age occurs, which is `AGE_MS`.
     /// Callers can ask for the precomputed value they already want.
     /// rolling 'current' age
     pub age: AtomicAge,
@@ -134,7 +135,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
     /// return when the bg threads have reached an 'idle' state
     pub fn wait_for_idle(&self) {
         assert!(self.get_startup());
-        if self.disk.is_none() {
+        if !self.is_disk_index_enabled() {
             return;
         }
 
@@ -315,13 +316,18 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
         can_advance_age: bool,
     ) {
         let bins = in_mem.len();
-        let flush = self.disk.is_some();
+        let flush = self.is_disk_index_enabled();
         let mut throttling_wait_ms = None;
         loop {
             if !flush {
+                let mut m = Measure::start("wait");
                 self.wait_dirty_or_aged.wait_timeout(Duration::from_millis(
                     self.stats.remaining_until_next_interval(),
                 ));
+                m.stop();
+                self.stats
+                    .bg_waiting_us
+                    .fetch_add(m.as_us(), Ordering::Relaxed);
             } else if self.should_thread_sleep() || throttling_wait_ms.is_some() {
                 let mut wait = std::cmp::min(
                     self.age_timer

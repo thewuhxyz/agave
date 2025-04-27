@@ -4,6 +4,7 @@
 // Export tokio for test clients
 pub use tokio;
 use {
+    agave_feature_set::FEATURE_NAMES,
     async_trait::async_trait,
     base64::{prelude::BASE64_STANDARD, Engine},
     chrono_humanize::{Accuracy, HumanTime, Tense},
@@ -13,7 +14,6 @@ use {
     solana_banks_server::banks_server::start_local_server,
     solana_bpf_loader_program::serialization::serialize_parameters,
     solana_compute_budget::compute_budget::ComputeBudget,
-    solana_feature_set::FEATURE_NAMES,
     solana_instruction::{error::InstructionError, Instruction},
     solana_log_collector::ic_msg,
     solana_program_runtime::{
@@ -69,11 +69,11 @@ pub use {
     solana_banks_client::{BanksClient, BanksClientError},
     solana_banks_interface::BanksTransactionResultWithMetadata,
     solana_program_runtime::invoke_context::InvokeContext,
-    solana_rbpf::{
+    solana_sbpf::{
         error::EbpfError,
         vm::{get_runtime_environment_key, EbpfVm},
     },
-    solana_sdk::transaction_context::IndexOfAccount,
+    solana_transaction_context::IndexOfAccount,
 };
 
 pub mod programs;
@@ -127,10 +127,14 @@ pub fn invoke_builtin_function(
     let deduplicated_indices: HashSet<IndexOfAccount> = instruction_account_indices.collect();
 
     // Serialize entrypoint parameters with SBF ABI
+    let mask_out_rent_epoch_in_vm_serialization = invoke_context
+        .get_feature_set()
+        .is_active(&agave_feature_set::mask_out_rent_epoch_in_vm_serialization::id());
     let (mut parameter_bytes, _regions, _account_lengths) = serialize_parameters(
         transaction_context,
         instruction_context,
         true, // copy_account_data // There is no VM so direct mapping can not be implemented here
+        mask_out_rent_epoch_in_vm_serialization,
     )?;
 
     // Deserialize data back into instruction params
@@ -497,7 +501,7 @@ impl Default for ProgramTest {
     ///
     fn default() -> Self {
         solana_logger::setup_with_default(
-            "solana_rbpf::vm=debug,\
+            "solana_sbpf::vm=debug,\
              solana_runtime::message_processor=debug,\
              solana_runtime::system_instruction_processor=trace,\
              solana_program_test=info",
@@ -815,7 +819,7 @@ impl ProgramTest {
             bootstrap_validator_stake_lamports,
             42,
             fee_rate_governor,
-            rent,
+            rent.clone(),
             ClusterType::Development,
             std::mem::take(&mut self.genesis_accounts),
         );
@@ -866,7 +870,16 @@ impl ProgramTest {
         );
 
         // Add commonly-used SPL programs as a convenience to the user
-        for (program_id, account) in programs::spl_programs(&Rent::default()).iter() {
+        for (program_id, account) in programs::spl_programs(&rent).iter() {
+            bank.store_account(program_id, account);
+        }
+
+        // Add migrated Core BPF programs.
+        for (program_id, account) in programs::core_bpf_programs(&rent, |feature_id| {
+            genesis_config.accounts.contains_key(feature_id)
+        })
+        .iter()
+        {
             bank.store_account(program_id, account);
         }
 

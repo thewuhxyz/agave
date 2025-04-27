@@ -10,9 +10,11 @@ use {
     rand::{thread_rng, Rng},
     rayon::{prelude::*, ThreadPool},
     serde::{Deserialize, Serialize},
+    solana_hash::Hash,
     solana_measure::measure::Measure,
     solana_merkle_tree::MerkleTree,
     solana_metrics::*,
+    solana_packet::Meta,
     solana_perf::{
         cuda_runtime::PinnedVec,
         packet::{Packet, PacketBatch, PacketBatchRecycler, PACKETS_PER_BATCH},
@@ -21,20 +23,16 @@ use {
         sigverify,
     },
     solana_rayon_threadlimit::get_max_thread_count,
-    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-    solana_sdk::{
-        hash::Hash,
-        packet::Meta,
-        transaction::{
-            Result, SanitizedTransaction, Transaction, TransactionError,
-            TransactionVerificationMode, VersionedTransaction,
-        },
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_transaction::{
+        versioned::VersionedTransaction, Transaction, TransactionVerificationMode,
     },
+    solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::{
         cmp,
         ffi::OsStr,
         iter::repeat_with,
-        sync::{Arc, Mutex, Once},
+        sync::{Arc, Mutex, Once, OnceLock},
         thread::{self, JoinHandle},
         time::Instant,
     },
@@ -43,7 +41,7 @@ use {
 pub type EntrySender = Sender<Vec<Entry>>;
 pub type EntryReceiver = Receiver<Vec<Entry>>;
 
-static mut API: Option<Container<Api>> = None;
+static API: OnceLock<Container<Api>> = OnceLock::new();
 
 pub fn init_poh() {
     init(OsStr::new("libpoh-simd.so"));
@@ -53,23 +51,23 @@ fn init(name: &OsStr) {
     static INIT_HOOK: Once = Once::new();
 
     info!("Loading {:?}", name);
-    unsafe {
-        INIT_HOOK.call_once(|| {
-            let path;
-            let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs()
-            {
-                solana_perf::perf_libs::append_to_ld_library_path(
-                    perf_libs_path.to_str().unwrap_or("").to_string(),
-                );
-                path = perf_libs_path.join(name);
-                path.as_os_str()
-            } else {
-                name
-            };
+    INIT_HOOK.call_once(|| {
+        let path;
+        let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs() {
+            solana_perf::perf_libs::append_to_ld_library_path(
+                perf_libs_path.to_str().unwrap_or("").to_string(),
+            );
+            path = perf_libs_path.join(name);
+            path.as_os_str()
+        } else {
+            name
+        };
 
-            API = Container::load(lib_name).ok();
-        })
-    }
+        match unsafe { Container::load(lib_name) } {
+            Ok(api) => _ = API.set(api),
+            Err(err) => error!("Unable to load {lib_name:?}: {err}"),
+        }
+    })
 }
 
 pub fn api() -> Option<&'static Container<Api<'static>>> {
@@ -79,10 +77,10 @@ pub fn api() -> Option<&'static Container<Api<'static>>> {
             if std::env::var("TEST_PERF_LIBS").is_ok() {
                 init_poh()
             }
-        })
+        });
     }
 
-    unsafe { API.as_ref() }
+    API.get()
 }
 
 #[derive(SymBorApi)]
@@ -151,8 +149,8 @@ impl From<&Entry> for EntrySummary {
 }
 
 /// Typed entry to distinguish between transaction and tick entries
-pub enum EntryType {
-    Transactions(Vec<RuntimeTransaction<SanitizedTransaction>>),
+pub enum EntryType<Tx: TransactionWithMeta> {
+    Transactions(Vec<Tx>),
     Tick(Hash),
 }
 
@@ -286,15 +284,15 @@ pub enum DeviceSigVerificationData {
     Gpu(GpuSigVerificationData),
 }
 
-pub struct EntrySigVerificationState {
+pub struct EntrySigVerificationState<Tx: TransactionWithMeta> {
     verification_status: EntryVerificationStatus,
-    entries: Option<Vec<EntryType>>,
+    entries: Option<Vec<EntryType<Tx>>>,
     device_verification_data: DeviceSigVerificationData,
     gpu_verify_duration_us: u64,
 }
 
-impl EntrySigVerificationState {
-    pub fn entries(&mut self) -> Option<Vec<EntryType>> {
+impl<Tx: TransactionWithMeta> EntrySigVerificationState<Tx> {
+    pub fn entries(&mut self) -> Option<Vec<EntryType<Tx>>> {
         self.entries.take()
     }
     pub fn finish_verify(&mut self) -> bool {
@@ -392,15 +390,11 @@ impl EntryVerificationState {
     }
 }
 
-pub fn verify_transactions(
+pub fn verify_transactions<Tx: TransactionWithMeta + Send + Sync>(
     entries: Vec<Entry>,
     thread_pool: &ThreadPool,
-    verify: Arc<
-        dyn Fn(VersionedTransaction) -> Result<RuntimeTransaction<SanitizedTransaction>>
-            + Send
-            + Sync,
-    >,
-) -> Result<Vec<EntryType>> {
+    verify: Arc<dyn Fn(VersionedTransaction) -> Result<Tx> + Send + Sync>,
+) -> Result<Vec<EntryType<Tx>>> {
     thread_pool.install(|| {
         entries
             .into_par_iter()
@@ -421,20 +415,15 @@ pub fn verify_transactions(
     })
 }
 
-pub fn start_verify_transactions(
+pub fn start_verify_transactions<Tx: TransactionWithMeta + Send + Sync + 'static>(
     entries: Vec<Entry>,
     skip_verification: bool,
     thread_pool: &ThreadPool,
     verify_recyclers: VerifyRecyclers,
     verify: Arc<
-        dyn Fn(
-                VersionedTransaction,
-                TransactionVerificationMode,
-            ) -> Result<RuntimeTransaction<SanitizedTransaction>>
-            + Send
-            + Sync,
+        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
     >,
-) -> Result<EntrySigVerificationState> {
+) -> Result<EntrySigVerificationState<Tx>> {
     let api = perf_libs::api();
 
     // Use the CPU if we have too few transactions for GPU signature verification to be worth it.
@@ -463,19 +452,14 @@ pub fn start_verify_transactions(
     }
 }
 
-fn start_verify_transactions_cpu(
+fn start_verify_transactions_cpu<Tx: TransactionWithMeta + Send + Sync + 'static>(
     entries: Vec<Entry>,
     skip_verification: bool,
     thread_pool: &ThreadPool,
     verify: Arc<
-        dyn Fn(
-                VersionedTransaction,
-                TransactionVerificationMode,
-            ) -> Result<RuntimeTransaction<SanitizedTransaction>>
-            + Send
-            + Sync,
+        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
     >,
-) -> Result<EntrySigVerificationState> {
+) -> Result<EntrySigVerificationState<Tx>> {
     let verify_func = {
         let mode = if skip_verification {
             TransactionVerificationMode::HashOnly
@@ -496,21 +480,16 @@ fn start_verify_transactions_cpu(
     })
 }
 
-fn start_verify_transactions_gpu(
+fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static>(
     entries: Vec<Entry>,
     verify_recyclers: VerifyRecyclers,
     thread_pool: &ThreadPool,
     verify: Arc<
-        dyn Fn(
-                VersionedTransaction,
-                TransactionVerificationMode,
-            ) -> Result<RuntimeTransaction<SanitizedTransaction>>
-            + Send
-            + Sync,
+        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
     >,
-) -> Result<EntrySigVerificationState> {
+) -> Result<EntrySigVerificationState<Tx>> {
     let verify_func = {
-        move |versioned_tx: VersionedTransaction| -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        move |versioned_tx: VersionedTransaction| -> Result<Tx> {
             verify(
                 versioned_tx,
                 TransactionVerificationMode::HashAndVerifyPrecompiles,
@@ -703,7 +682,7 @@ impl EntrySlice for [Entry] {
         simd_len: usize,
         thread_pool: &ThreadPool,
     ) -> EntryVerificationState {
-        use solana_sdk::hash::HASH_BYTES;
+        use solana_hash::HASH_BYTES;
         let now = Instant::now();
         let genesis = [Entry {
             num_hashes: 0,
@@ -711,7 +690,7 @@ impl EntrySlice for [Entry] {
             transactions: vec![],
         }];
 
-        let aligned_len = ((self.len() + simd_len - 1) / simd_len) * simd_len;
+        let aligned_len = self.len().div_ceil(simd_len) * simd_len;
         let mut hashes_bytes = vec![0u8; HASH_BYTES * aligned_len];
         genesis
             .iter()
@@ -766,7 +745,9 @@ impl EntrySlice for [Entry] {
                         .all(|(j, ref_entry)| {
                             let start = j * HASH_BYTES;
                             let end = start + HASH_BYTES;
-                            let hash = Hash::new(&chunk[start..end]);
+                            let hash = <[u8; HASH_BYTES]>::try_from(&chunk[start..end])
+                                .map(Hash::new_from_array)
+                                .unwrap();
                             compare_hashes(hash, ref_entry)
                         })
                 })
@@ -993,18 +974,21 @@ pub fn thread_pool_for_benches() -> ThreadPool {
 mod tests {
     use {
         super::*,
+        agave_reserved_account_keys::ReservedAccountKeys,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::SimpleAddressLoader,
         solana_perf::test_tx::{test_invalid_tx, test_tx},
-        solana_sdk::{
-            hash::{hash, Hash},
-            pubkey::Pubkey,
-            reserved_account_keys::ReservedAccountKeys,
-            signature::{Keypair, Signer},
-            system_transaction,
-            transaction::{
-                MessageHash, Result, SanitizedTransaction, SimpleAddressLoader,
-                VersionedTransaction,
-            },
+        solana_pubkey::Pubkey,
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+        solana_sha256_hasher::hash,
+        solana_signer::Signer,
+        solana_system_transaction as system_transaction,
+        solana_transaction::{
+            sanitized::{MessageHash, SanitizedTransaction},
+            versioned::VersionedTransaction,
         },
+        solana_transaction_error::TransactionResult as Result,
     };
 
     #[test]
@@ -1017,18 +1001,13 @@ mod tests {
         assert!(!next_entry(&zero, 1, vec![]).verify(&one)); // inductive step, bad
     }
 
-    fn test_verify_transactions(
+    fn test_verify_transactions<Tx: TransactionWithMeta + Send + Sync + 'static>(
         entries: Vec<Entry>,
         skip_verification: bool,
         verify_recyclers: VerifyRecyclers,
         thread_pool: &ThreadPool,
         verify: Arc<
-            dyn Fn(
-                    VersionedTransaction,
-                    TransactionVerificationMode,
-                ) -> Result<RuntimeTransaction<SanitizedTransaction>>
-                + Send
-                + Sync,
+            dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
         >,
     ) -> bool {
         let verify_func = {
@@ -1038,14 +1017,14 @@ mod tests {
             } else {
                 TransactionVerificationMode::FullVerification
             };
-            move |versioned_tx: VersionedTransaction| -> Result<RuntimeTransaction<SanitizedTransaction>> {
+            move |versioned_tx: VersionedTransaction| -> Result<Tx> {
                 verify(versioned_tx, verification_mode)
             }
         };
 
         let cpu_verify_result =
             verify_transactions(entries.clone(), thread_pool, Arc::new(verify_func));
-        let mut gpu_verify_result: EntrySigVerificationState = {
+        let mut gpu_verify_result: EntrySigVerificationState<Tx> = {
             let verify_result = start_verify_transactions(
                 entries,
                 skip_verification,
@@ -1163,7 +1142,7 @@ mod tests {
     fn test_transaction_signing() {
         let thread_pool = thread_pool_for_tests();
 
-        use solana_sdk::signature::Signature;
+        use solana_signature::Signature;
         let zero = Hash::default();
 
         let keypair = Keypair::new();

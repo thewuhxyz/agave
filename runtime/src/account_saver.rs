@@ -1,9 +1,6 @@
 use {
     core::borrow::Borrow,
-    solana_sdk::{
-        account::AccountSharedData, pubkey::Pubkey, transaction::SanitizedTransaction,
-        transaction_context::TransactionAccount,
-    },
+    solana_sdk::{account::AccountSharedData, pubkey::Pubkey, transaction::SanitizedTransaction},
     solana_svm::{
         rollback_accounts::RollbackAccounts,
         transaction_processing_result::{
@@ -12,6 +9,7 @@ use {
         },
     },
     solana_svm_transaction::svm_message::SVMMessage,
+    solana_transaction_context::TransactionAccount,
 };
 
 // Used to approximate how many accounts will be calculated for storage so that
@@ -239,7 +237,7 @@ mod tests {
     fn test_collect_accounts_to_store() {
         let keypair0 = Keypair::new();
         let keypair1 = Keypair::new();
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let account0 = AccountSharedData::new(1, 0, &Pubkey::default());
         let account1 = AccountSharedData::new(2, 0, &Pubkey::default());
         let account2 = AccountSharedData::new(3, 0, &Pubkey::default());

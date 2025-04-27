@@ -108,7 +108,7 @@ impl RestartLastVotedForkSlots {
 
     /// New random Version for tests and benchmarks.
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
-        let pubkey = pubkey.unwrap_or_else(solana_sdk::pubkey::new_rand);
+        let pubkey = pubkey.unwrap_or_else(solana_pubkey::new_rand);
         let num_slots = rng.gen_range(2..20);
         let slots = std::iter::repeat_with(|| 47825632 + rng.gen_range(0..512))
             .take(num_slots)
@@ -144,7 +144,7 @@ impl Sanitize for RestartHeaviestFork {
 
 impl RestartHeaviestFork {
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, from: Option<Pubkey>) -> Self {
-        let from = from.unwrap_or_else(solana_sdk::pubkey::new_rand);
+        let from = from.unwrap_or_else(solana_pubkey::new_rand);
         Self {
             from,
             wallclock: new_rand_timestamp(rng),
@@ -284,8 +284,7 @@ mod test {
             shred_version,
         )
         .unwrap();
-        let value =
-            CrdsValue::new_signed(CrdsData::RestartLastVotedForkSlots(slots.clone()), &keypair);
+        let value = CrdsValue::new(CrdsData::RestartLastVotedForkSlots(slots.clone()), &keypair);
         assert_eq!(value.sanitize(), Ok(()));
         let label = value.label();
         assert_eq!(

@@ -1,9 +1,15 @@
 //! Code for stake and vote rewards
 
 use {
-    crate::storable_accounts::{AccountForStorage, StorableAccounts},
+    crate::{
+        accounts_index::ZeroLamport,
+        storable_accounts::{AccountForStorage, StorableAccounts},
+    },
+    solana_pubkey::Pubkey,
     solana_sdk::{
-        account::AccountSharedData, clock::Slot, pubkey::Pubkey, reward_info::RewardInfo,
+        account::{AccountSharedData, ReadableAccount},
+        clock::Slot,
+        reward_info::RewardInfo,
     },
 };
 
@@ -21,6 +27,12 @@ impl StakeReward {
     }
 }
 
+impl ZeroLamport for StakeReward {
+    fn is_zero_lamport(&self) -> bool {
+        self.stake_account.lamports() == 0
+    }
+}
+
 /// allow [StakeReward] to be passed to `StoreAccounts` directly without copies or vec construction
 impl<'a> StorableAccounts<'a> for (Slot, &'a [StakeReward]) {
     fn account<Ret>(
@@ -30,6 +42,12 @@ impl<'a> StorableAccounts<'a> for (Slot, &'a [StakeReward]) {
     ) -> Ret {
         let entry = &self.1[index];
         callback((&self.1[index].stake_pubkey, &entry.stake_account).into())
+    }
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        self.1[index].is_zero_lamport()
+    }
+    fn data_len(&self, index: usize) -> usize {
+        self.1[index].stake_account.data().len()
     }
     fn slot(&self, _index: usize) -> Slot {
         // per-index slot is not unique per slot when per-account slot is not included in the source data
@@ -63,7 +81,7 @@ impl StakeReward {
 
         let rent = Rent::free();
 
-        let validator_pubkey = solana_sdk::pubkey::new_rand();
+        let validator_pubkey = solana_pubkey::new_rand();
         let validator_stake_lamports = 20;
         let validator_staking_keypair = Keypair::new();
         let validator_voting_keypair = Keypair::new();

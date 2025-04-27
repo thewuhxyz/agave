@@ -1,10 +1,11 @@
 //! A helper to initialize Solana SVM API's `TransactionBatchProcessor`.
 
 use {
+    agave_feature_set::FeatureSet,
     solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_program_runtime::loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
-    solana_sdk::{clock::Slot, feature_set::FeatureSet, transaction},
+    solana_sdk::{clock::Slot, transaction},
     solana_svm::{
         account_loader::CheckedTransactionDetails,
         transaction_processing_callback::TransactionProcessingCallback,
@@ -47,23 +48,16 @@ pub(crate) fn create_transaction_batch_processor<CB: TransactionProcessingCallba
     // marked as "depoyed" in slot 0.
     // See `solana_svm::program_loader::load_program_with_pubkey` for more
     // details.
-    let processor = TransactionBatchProcessor::<PayTubeForkGraph>::new_uninitialized(
-        /* slot */ 1, /* epoch */ 1,
-    );
-
-    {
-        let mut cache = processor.program_cache.write().unwrap();
-
-        // Initialize the mocked fork graph.
-        cache.fork_graph = Some(Arc::downgrade(&fork_graph));
-
-        // Initialize a proper cache environment.
-        // (Use Loader v4 program to initialize runtime v2 if desired)
-        cache.environments.program_runtime_v1 = Arc::new(
+    let processor = TransactionBatchProcessor::<PayTubeForkGraph>::new(
+        /* slot */ 1,
+        /* epoch */ 1,
+        Arc::downgrade(&fork_graph),
+        Some(Arc::new(
             create_program_runtime_environment_v1(feature_set, compute_budget, false, false)
                 .unwrap(),
-        );
-    }
+        )),
+        None,
+    );
 
     // Add the system program builtin.
     processor.add_builtin(
@@ -99,11 +93,5 @@ pub(crate) fn get_transaction_check_results(
     len: usize,
     lamports_per_signature: u64,
 ) -> Vec<transaction::Result<CheckedTransactionDetails>> {
-    vec![
-        transaction::Result::Ok(CheckedTransactionDetails {
-            nonce: None,
-            lamports_per_signature,
-        });
-        len
-    ]
+    vec![transaction::Result::Ok(CheckedTransactionDetails::new(None, lamports_per_signature)); len]
 }

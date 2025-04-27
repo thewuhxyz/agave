@@ -18,7 +18,10 @@ pub struct DefaultThreadArgs {
     pub rayon_global_threads: String,
     pub replay_forks_threads: String,
     pub replay_transactions_threads: String,
+    pub rocksdb_compaction_threads: String,
+    pub rocksdb_flush_threads: String,
     pub tvu_receive_threads: String,
+    pub tvu_retransmit_threads: String,
     pub tvu_sigverify_threads: String,
 }
 
@@ -36,7 +39,10 @@ impl Default for DefaultThreadArgs {
             replay_forks_threads: ReplayForksThreadsArg::bounded_default().to_string(),
             replay_transactions_threads: ReplayTransactionsThreadsArg::bounded_default()
                 .to_string(),
+            rocksdb_compaction_threads: RocksdbCompactionThreadsArg::bounded_default().to_string(),
+            rocksdb_flush_threads: RocksdbFlushThreadsArg::bounded_default().to_string(),
             tvu_receive_threads: TvuReceiveThreadsArg::bounded_default().to_string(),
+            tvu_retransmit_threads: TvuRetransmitThreadsArg::bounded_default().to_string(),
             tvu_sigverify_threads: TvuShredSigverifyThreadsArg::bounded_default().to_string(),
         }
     }
@@ -52,7 +58,10 @@ pub fn thread_args<'a>(defaults: &DefaultThreadArgs) -> Vec<Arg<'_, 'a>> {
         new_thread_arg::<RayonGlobalThreadsArg>(&defaults.rayon_global_threads),
         new_thread_arg::<ReplayForksThreadsArg>(&defaults.replay_forks_threads),
         new_thread_arg::<ReplayTransactionsThreadsArg>(&defaults.replay_transactions_threads),
+        new_thread_arg::<RocksdbCompactionThreadsArg>(&defaults.rocksdb_compaction_threads),
+        new_thread_arg::<RocksdbFlushThreadsArg>(&defaults.rocksdb_flush_threads),
         new_thread_arg::<TvuReceiveThreadsArg>(&defaults.tvu_receive_threads),
+        new_thread_arg::<TvuRetransmitThreadsArg>(&defaults.tvu_retransmit_threads),
         new_thread_arg::<TvuShredSigverifyThreadsArg>(&defaults.tvu_sigverify_threads),
     ]
 }
@@ -77,7 +86,10 @@ pub struct NumThreadConfig {
     pub rayon_global_threads: NonZeroUsize,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
+    pub rocksdb_compaction_threads: NonZeroUsize,
+    pub rocksdb_flush_threads: NonZeroUsize,
     pub tvu_receive_threads: NonZeroUsize,
+    pub tvu_retransmit_threads: NonZeroUsize,
     pub tvu_sigverify_threads: NonZeroUsize,
 }
 
@@ -119,7 +131,22 @@ pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
             ReplayTransactionsThreadsArg::NAME,
             NonZeroUsize
         ),
+        rocksdb_compaction_threads: value_t_or_exit!(
+            matches,
+            RocksdbCompactionThreadsArg::NAME,
+            NonZeroUsize
+        ),
+        rocksdb_flush_threads: value_t_or_exit!(
+            matches,
+            RocksdbFlushThreadsArg::NAME,
+            NonZeroUsize
+        ),
         tvu_receive_threads: value_t_or_exit!(matches, TvuReceiveThreadsArg::NAME, NonZeroUsize),
+        tvu_retransmit_threads: value_t_or_exit!(
+            matches,
+            TvuRetransmitThreadsArg::NAME,
+            NonZeroUsize
+        ),
         tvu_sigverify_threads: value_t_or_exit!(
             matches,
             TvuShredSigverifyThreadsArg::NAME,
@@ -257,6 +284,28 @@ impl ThreadArg for ReplayTransactionsThreadsArg {
     }
 }
 
+struct RocksdbCompactionThreadsArg;
+impl ThreadArg for RocksdbCompactionThreadsArg {
+    const NAME: &'static str = "rocksdb_compaction_threads";
+    const LONG_NAME: &'static str = "rocksdb-compaction-threads";
+    const HELP: &'static str = "Number of threads to use for rocksdb (Blockstore) compactions";
+
+    fn default() -> usize {
+        solana_ledger::blockstore::default_num_compaction_threads().get()
+    }
+}
+
+struct RocksdbFlushThreadsArg;
+impl ThreadArg for RocksdbFlushThreadsArg {
+    const NAME: &'static str = "rocksdb_flush_threads";
+    const LONG_NAME: &'static str = "rocksdb-flush-threads";
+    const HELP: &'static str = "Number of threads to use for rocksdb (Blockstore) memtable flushes";
+
+    fn default() -> usize {
+        solana_ledger::blockstore::default_num_flush_threads().get()
+    }
+}
+
 struct TvuReceiveThreadsArg;
 impl ThreadArg for TvuReceiveThreadsArg {
     const NAME: &'static str = "tvu_receive_threads";
@@ -265,10 +314,25 @@ impl ThreadArg for TvuReceiveThreadsArg {
         "Number of threads (and sockets) to use for receiving shreds on the TVU port";
 
     fn default() -> usize {
-        solana_gossip::cluster_info::DEFAULT_NUM_TVU_SOCKETS.get()
+        solana_gossip::cluster_info::DEFAULT_NUM_TVU_RECEIVE_SOCKETS.get()
     }
     fn min() -> usize {
-        solana_gossip::cluster_info::MINIMUM_NUM_TVU_SOCKETS.get()
+        solana_gossip::cluster_info::MINIMUM_NUM_TVU_RECEIVE_SOCKETS.get()
+    }
+}
+
+struct TvuRetransmitThreadsArg;
+impl ThreadArg for TvuRetransmitThreadsArg {
+    const NAME: &'static str = "tvu_retransmit_threads";
+    const LONG_NAME: &'static str = "tvu-retransmit-threads";
+    const HELP: &'static str = "Number of threads (and sockets) to use for retransmitting shreds";
+
+    fn default() -> usize {
+        solana_gossip::cluster_info::DEFAULT_NUM_TVU_RETRANSMIT_SOCKETS.get()
+    }
+
+    fn min() -> usize {
+        solana_gossip::cluster_info::MINIMUM_NUM_TVU_RETRANSMIT_SOCKETS.get()
     }
 }
 
